@@ -1,3 +1,2 @@
-streamlit
-pandas
-openpyxl
+streamlit>=1.29.0
+pandas>=2.0.0

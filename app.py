@@ -1,21 +1,33 @@
+import re
+from urllib.parse import urlparse
+
 import pandas as pd
 import streamlit as st
-from urllib.parse import urlparse, quote
+
 
 # -----------------------------
 # 기본 설정
 # -----------------------------
 st.set_page_config(page_title="기업 지원사업 검색", layout="wide")
 st.title("기업 지원사업 검색")
-st.caption("왼쪽 필터(지역/분야/매출액/고용인원)로 조건에 맞는 사업만 조회합니다.")
+st.caption("왼쪽 필터 조건에 맞는 사업만 표로 보여주고, 하단에서 사업을 선택하면 전체 세부내용을 확인할 수 있습니다.")
 
 DATA_PATH = "260206.csv"
+
 
 # -----------------------------
 # 유틸 함수
 # -----------------------------
+def pick_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """후보 컬럼명 중 실제 df에 존재하는 첫 컬럼명을 반환"""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
 def ensure_url(value: str) -> str:
-    """링크가 스킴(http/https) 없이 들어온 경우 https:// 를 붙여줍니다."""
+    """링크가 http/https 없이 들어온 경우 https:// 붙이기"""
     if value is None:
         return ""
     s = str(value).strip()
@@ -26,42 +38,85 @@ def ensure_url(value: str) -> str:
         return s
     return "https://" + s.lstrip("/")
 
+
+def normalize_region_text(s: str) -> str:
+    """구분자/괄호/공백 등 정리"""
+    s = str(s)
+    s = s.replace("·", ",").replace("/", ",").replace(";", ",").replace("|", ",")
+    s = s.replace("\n", " ").replace("\t", " ")
+    s = s.replace("(", " ").replace(")", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+GYEONGBUK_WHOLE_KEYWORDS = {
+    "경상북도", "경북",
+    "경상북도 전체", "경상북도전역",
+    "경북 전체", "경북전역", "경북 전역",
+    "경상북도 전역",
+}
+
+
+def is_gyeongbuk_whole(region_cell: str) -> bool:
+    """지역 값이 '경상북도(전역/전체/경북 등)'이면 True"""
+    if region_cell is None:
+        return False
+    raw = str(region_cell).strip()
+    if raw == "" or raw.lower() == "nan":
+        return False
+
+    raw = normalize_region_text(raw)
+    compact = raw.replace(" ", "")
+
+    for kw in GYEONGBUK_WHOLE_KEYWORDS:
+        if kw.replace(" ", "") in compact:
+            return True
+    return False
+
+
 def split_regions(region_cell: str) -> list[str]:
-    """'A, B, C' 형태의 지역 문자열을 리스트로 변환"""
+    """일반 지역 문자열을 콤마 기준 리스트로 변환 (정제 포함)"""
     if region_cell is None:
         return []
-    s = str(region_cell)
-    if s.strip() == "" or s.lower() == "nan":
+    raw = str(region_cell).strip()
+    if raw == "" or raw.lower() == "nan":
         return []
-    return [x.strip() for x in s.split(",") if x.strip()]
 
-def pick_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """후보 컬럼명 중 실제 df에 존재하는 첫 컬럼명을 반환"""
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
+    raw = normalize_region_text(raw)
 
-def open_new_tab(url: str, label: str = "새 창으로 열기", key: str = "open_new_tab"):
-    """
-    Streamlit은 기본 버튼만으로 새 탭을 못 띄우는 경우가 많아
-    HTML+JS window.open으로 새 탭을 여는 방식 사용
-    """
-    safe_url = url.replace('"', "%22")
-    st.components.v1.html(
-        f"""
-        <button
-          style="
-            background:#0e7aff;color:white;border:none;padding:10px 14px;
-            border-radius:10px;cursor:pointer;font-weight:600;
-          "
-          onclick='window.open("{safe_url}", "_blank")'
-        >
-          {label}
-        </button>
-        """,
-        height=52,
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    cleaned = []
+    for p in parts:
+        # '경상북도', '경북' 같은 상위 표기는 제거(시군만 남기려는 목적)
+        p = p.replace("경상북도", "").replace("경북", "").strip()
+        if p:
+            cleaned.append(p)
+
+    # 중복 제거(순서 유지)
+    seen = set()
+    result = []
+    for x in cleaned:
+        if x not in seen:
+            seen.add(x)
+            result.append(x)
+    return result
+
+
+def coerce_numeric_series(s: pd.Series) -> pd.Series:
+    """숫자형 변환: 콤마/공백/단위 섞여도 최대한 숫자로 변환"""
+    # 예: "1,200", "약 10", "10명", "10 억" 등
+    cleaned = (
+        s.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace("명", "", regex=False)
+        .str.replace("억원", "", regex=False)
+        .str.replace("억", "", regex=False)
     )
+    # 숫자/소수점/마이너스만 남기고 제거
+    cleaned = cleaned.str.replace(r"[^0-9\.\-]", "", regex=True)
+    return pd.to_numeric(cleaned, errors="coerce")
+
 
 # -----------------------------
 # 데이터 로드
@@ -70,156 +125,171 @@ def open_new_tab(url: str, label: str = "새 창으로 열기", key: str = "open
 def load_data(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
+
 try:
     df = load_data(DATA_PATH)
 except Exception as e:
     st.error(f"데이터 파일을 불러오지 못했습니다: {DATA_PATH}\n\n{e}")
     st.stop()
 
-# -----------------------------
-# 컬럼 매핑 (CSV에 따라 자동으로 잡히도록 후보군)
-# -----------------------------
+# 내부 식별자
+df["_row_id"] = range(len(df))
+
+# 컬럼 매핑 (CSV가 조금 달라도 동작하도록 후보군)
 COL_TITLE = pick_existing_column(df, ["사업명", "사업", "지원사업명", "프로그램명"])
 COL_REGION = pick_existing_column(df, ["지역", "소재지", "권역"])
 COL_FIELD = pick_existing_column(df, ["분야", "산업분야", "업종", "산업"])
 COL_SALES = pick_existing_column(df, ["매출액", "매출액조건", "매출", "매출액(억원)"])
-COL_EMP   = pick_existing_column(df, ["고용인력", "고용인원", "고용", "고용인원(명)"])
-COL_LINK  = pick_existing_column(df, ["링크", "공고링크", "URL", "홈페이지", "공고 URL"])
+COL_EMP = pick_existing_column(df, ["고용인력", "고용인원", "고용", "고용인원(명)"])
+COL_LINK = pick_existing_column(df, ["링크", "공고링크", "URL", "홈페이지", "공고 URL"])
+COL_ORG = pick_existing_column(df, ["주관기관", "수행기관", "기관", "운영기관"])
 
-# ✅ 설명 이미지(추가): CSV에 아래 중 하나 컬럼이 있으면 사용 (이미지 URL 또는 로컬 파일경로)
-COL_IMAGE = pick_existing_column(df, ["설명이미지", "이미지", "이미지URL", "이미지 URL", "사업이미지", "포스터", "썸네일"])
-
-# 내부 식별자(행 고유 id) 추가
-df["_row_id"] = range(len(df))
-
-# 링크/이미지 URL 정리
+# 링크 정리
 if COL_LINK:
     df[COL_LINK] = df[COL_LINK].apply(ensure_url)
-if COL_IMAGE:
-    df[COL_IMAGE] = df[COL_IMAGE].apply(ensure_url)
 
-# 지역 리스트
+# 지역 정제 + 경북전역 플래그
 if COL_REGION:
-    df["_지역리스트"] = df[COL_REGION].apply(split_regions)
+    df["_is_gyeongbuk_whole"] = df[COL_REGION].apply(is_gyeongbuk_whole)
+    df["_region_list"] = df[COL_REGION].apply(split_regions)
 else:
-    df["_지역리스트"] = [[] for _ in range(len(df))]
+    df["_is_gyeongbuk_whole"] = False
+    df["_region_list"] = [[] for _ in range(len(df))]
+
+# 매출/고용 숫자화(필터가 슬라이더로 동작할 수 있도록)
+if COL_SALES:
+    df["_sales_num"] = coerce_numeric_series(df[COL_SALES])
+else:
+    df["_sales_num"] = pd.NA
+
+if COL_EMP:
+    df["_emp_num"] = coerce_numeric_series(df[COL_EMP])
+else:
+    df["_emp_num"] = pd.NA
+
 
 # -----------------------------
-# (A) 상세 페이지 모드: ?detail=ROW_ID 로 들어오면 상세만 보여주기
-# -----------------------------
-query = st.query_params
-detail_id = query.get("detail", None)
-
-if detail_id is not None:
-    # 상세 페이지(새 탭에서 열릴 화면)
-    try:
-        rid = int(detail_id)
-    except:
-        st.error("잘못된 상세 페이지 요청입니다.")
-        st.stop()
-
-    row = df[df["_row_id"] == rid]
-    if row.empty:
-        st.warning("해당 사업을 찾을 수 없습니다.")
-        st.stop()
-
-    row = row.iloc[0].to_dict()
-
-    st.subheader(row.get(COL_TITLE, "사업 상세"))
-    st.caption("이 화면은 새 탭(새 창)에서 열리는 상세 페이지입니다.")
-
-    # 기본 정보(표 형태)
-    info_items = []
-    for c in df.columns:
-        if c in ["_row_id", "_지역리스트"]:
-            continue
-        v = row.get(c, "")
-        info_items.append({"항목": c, "값": "" if pd.isna(v) else str(v)})
-
-    info_df = pd.DataFrame(info_items)
-
-    # 링크는 클릭 가능하게
-    if COL_LINK and row.get(COL_LINK, ""):
-        link = row.get(COL_LINK, "")
-        st.markdown(f"**공고 링크:** [{link}]({link})")
-
-    # 설명 이미지 표시
-    if COL_IMAGE and row.get(COL_IMAGE, ""):
-        img = row.get(COL_IMAGE, "")
-        st.markdown("### 사업 관련 설명 이미지")
-        st.image(img, use_container_width=True)
-
-        # 이미지도 새 탭으로
-        st.markdown(f"[이미지 새 탭으로 열기]({img})")
-    else:
-        st.info("설명 이미지가 없습니다. (CSV에 '설명이미지/이미지URL' 컬럼을 추가하면 표시됩니다.)")
-
-    st.divider()
-    st.markdown("이 탭은 닫아도 됩니다.")
-    st.stop()
-
-# -----------------------------
-# (B) 검색/필터 메인 페이지
+# 사이드바 필터
 # -----------------------------
 st.sidebar.header("필터")
 
-# 지역(멀티선택)
+# (1) 지역(멀티선택)
 selected_regions = []
 if COL_REGION:
-    all_regions = sorted({r for sub in df["_지역리스트"] for r in sub})
-    selected_regions = st.sidebar.multiselect("지역(멀티선택)", options=all_regions, default=[])
+    # 지역 옵션은 실제 시군/지역명들만 뽑아 제공
+    region_options = sorted({r for lst in df["_region_list"] for r in lst if r})
+    selected_regions = st.sidebar.multiselect("지역(멀티선택)", options=region_options, default=[])
+else:
+    st.sidebar.info("데이터에 '지역' 컬럼이 없어 지역 필터를 생략합니다.")
 
-# 분야(멀티선택)
+# (2) 분야
 selected_fields = []
 if COL_FIELD:
-    all_fields = sorted(df[COL_FIELD].dropna().astype(str).unique().tolist())
-    selected_fields = st.sidebar.multiselect("분야", options=all_fields, default=[])
+    field_options = sorted(df[COL_FIELD].dropna().astype(str).unique().tolist())
+    selected_fields = st.sidebar.multiselect("분야", options=field_options, default=[])
+else:
+    st.sidebar.info("데이터에 '분야' 컬럼이 없어 분야 필터를 생략합니다.")
 
-# 매출액 범위
+# (3) 매출액
+sales_mode = None
 sales_range = None
-if COL_SALES and pd.api.types.is_numeric_dtype(df[COL_SALES]):
-    min_sales = int(df[COL_SALES].min())
-    max_sales = int(df[COL_SALES].max())
-    sales_range = st.sidebar.slider(
-        "매출액 범위", min_value=min_sales, max_value=max_sales,
-        value=(min_sales, max_sales), step=1
-    )
+sales_choice = None
 
-# 고용인원 범위
+if COL_SALES:
+    sales_numeric_ratio = df["_sales_num"].notna().mean()
+    # 숫자 변환이 충분히 되면 슬라이더, 아니면 선택/검색 방식
+    if sales_numeric_ratio >= 0.6 and df["_sales_num"].notna().any():
+        sales_mode = "numeric"
+        mn = float(df["_sales_num"].min())
+        mx = float(df["_sales_num"].max())
+        # 슬라이더는 int가 더 편한 경우가 많아 반올림
+        mn_i, mx_i = int(mn), int(mx)
+        sales_range = st.sidebar.slider(
+            "매출액 범위(숫자)",
+            min_value=mn_i,
+            max_value=mx_i,
+            value=(mn_i, mx_i),
+            step=1,
+        )
+    else:
+        sales_mode = "categorical"
+        sales_values = sorted(df[COL_SALES].fillna("").astype(str).unique().tolist())
+        sales_choice = st.sidebar.selectbox("매출액조건", options=["전체"] + sales_values, index=0)
+else:
+    st.sidebar.info("데이터에 '매출액/매출액조건' 컬럼이 없어 매출 필터를 생략합니다.")
+
+# (4) 고용인력
+emp_mode = None
 emp_range = None
-if COL_EMP and pd.api.types.is_numeric_dtype(df[COL_EMP]):
-    min_emp = int(df[COL_EMP].min())
-    max_emp = int(df[COL_EMP].max())
-    emp_range = st.sidebar.slider(
-        "고용인원 범위", min_value=min_emp, max_value=max_emp,
-        value=(min_emp, max_emp), step=1
-    )
+emp_choice = None
 
-st.sidebar.divider()
+if COL_EMP:
+    emp_numeric_ratio = df["_emp_num"].notna().mean()
+    if emp_numeric_ratio >= 0.6 and df["_emp_num"].notna().any():
+        emp_mode = "numeric"
+        mn = float(df["_emp_num"].min())
+        mx = float(df["_emp_num"].max())
+        mn_i, mx_i = int(mn), int(mx)
+        emp_range = st.sidebar.slider(
+            "고용인력 범위(숫자)",
+            min_value=mn_i,
+            max_value=mx_i,
+            value=(mn_i, mx_i),
+            step=1,
+        )
+    else:
+        emp_mode = "categorical"
+        emp_values = sorted(df[COL_EMP].fillna("").astype(str).unique().tolist())
+        emp_choice = st.sidebar.selectbox("고용인력(조건)", options=["전체"] + emp_values, index=0)
+else:
+    st.sidebar.info("데이터에 '고용인력' 컬럼이 없어 고용 필터를 생략합니다.")
+
 
 # -----------------------------
-# 필터링
+# 필터링 로직
 # -----------------------------
 filtered = df.copy()
 
+# 지역 필터
+# - 사용자가 지역을 선택했을 때:
+#   (a) 해당 사업이 '경상북도 전역(경북/경상북도 전체 포함)'이면 무조건 통과
+#   (b) 아니면 선택 지역 중 하나라도 포함되면 통과
 if COL_REGION and selected_regions:
-    filtered = filtered[filtered["_지역리스트"].apply(lambda lst: any(r in lst for r in selected_regions))]
+    filtered = filtered[
+        (filtered["_is_gyeongbuk_whole"] == True)
+        | (filtered["_region_list"].apply(lambda lst: any(r in lst for r in selected_regions)))
+    ]
 
+# 분야 필터
 if COL_FIELD and selected_fields:
     filtered = filtered[filtered[COL_FIELD].astype(str).isin(selected_fields)]
 
-if sales_range and COL_SALES and pd.api.types.is_numeric_dtype(filtered[COL_SALES]):
-    lo, hi = sales_range
-    filtered = filtered[(filtered[COL_SALES] >= lo) & (filtered[COL_SALES] <= hi)]
+# 매출액 필터
+if COL_SALES:
+    if sales_mode == "numeric" and sales_range is not None:
+        lo, hi = sales_range
+        # 숫자 변환 실패(NA)는 조건 판정이 어려우니 제외
+        filtered = filtered[filtered["_sales_num"].notna()]
+        filtered = filtered[(filtered["_sales_num"] >= lo) & (filtered["_sales_num"] <= hi)]
+    elif sales_mode == "categorical" and sales_choice and sales_choice != "전체":
+        filtered = filtered[filtered[COL_SALES].fillna("").astype(str) == str(sales_choice)]
 
-if emp_range and COL_EMP and pd.api.types.is_numeric_dtype(filtered[COL_EMP]):
-    lo, hi = emp_range
-    filtered = filtered[(filtered[COL_EMP] >= lo) & (filtered[COL_EMP] <= hi)]
+# 고용인력 필터
+if COL_EMP:
+    if emp_mode == "numeric" and emp_range is not None:
+        lo, hi = emp_range
+        filtered = filtered[filtered["_emp_num"].notna()]
+        filtered = filtered[(filtered["_emp_num"] >= lo) & (filtered["_emp_num"] <= hi)]
+    elif emp_mode == "categorical" and emp_choice and emp_choice != "전체":
+        filtered = filtered[filtered[COL_EMP].fillna("").astype(str) == str(emp_choice)]
+
 
 # -----------------------------
-# 결과 표시
+# 메인 테이블 출력
 # -----------------------------
-display_df = filtered.drop(columns=["_지역리스트"], errors="ignore").copy()
+# 표시에서 내부 컬럼 제외
+internal_cols = {"_row_id", "_region_list", "_is_gyeongbuk_whole", "_sales_num", "_emp_num"}
+display_df = filtered[[c for c in filtered.columns if c not in internal_cols]].copy()
 
 if display_df.empty:
     st.warning("조건에 맞는 사업이 없습니다")
@@ -227,73 +297,74 @@ if display_df.empty:
 
 st.subheader(f"검색 결과: {len(display_df):,}건")
 
-# ✅ (핵심) '사업명 클릭' 느낌을 만들기 위해 "행 선택" 기능을 사용
-# Streamlit 버전에 따라 selection 기능이 없을 수 있어, data_editor를 사용합니다.
-# - 사용자가 한 행을 클릭(선택)하면 아래에 상세 정보 표시
-show_cols = [c for c in display_df.columns if c not in ["_row_id"]]
-edited = st.data_editor(
-    display_df[show_cols],
-    use_container_width=True,
-    hide_index=True,
-    disabled=True,
-    key="result_table"
+if COL_LINK and COL_LINK in display_df.columns:
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            COL_LINK: st.column_config.LinkColumn(
+                "링크",
+                help="클릭하여 공고 페이지로 이동",
+                display_text="바로가기",
+            )
+        },
+    )
+else:
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+
+# -----------------------------
+# 하단 상세 보기: 드롭다운으로 선택 → 모든 데이터 표시
+# -----------------------------
+st.divider()
+st.subheader("사업 상세 보기 (필터링 결과에서 선택)")
+
+# 상세 선택용 라벨 생성 (동일 사업명 중복 대비)
+select_source = filtered.copy()
+if COL_TITLE is None:
+    st.info("사업명 컬럼을 찾지 못해 상세 선택 기능을 사용할 수 없습니다. (CSV 컬럼명을 확인해 주세요)")
+    st.stop()
+
+def make_label(row: pd.Series) -> str:
+    title = str(row.get(COL_TITLE, "")).strip()
+    if COL_ORG and COL_ORG in row.index:
+        org = str(row.get(COL_ORG, "")).strip()
+        if org and org.lower() != "nan":
+            return f"{title} | {org}"
+    return title
+
+select_source["_label"] = select_source.apply(make_label, axis=1)
+
+labels = select_source["_label"].astype(str).tolist()
+row_ids = select_source["_row_id"].astype(int).tolist()
+
+# 드롭다운 (가독성: 너무 길면 화면에서 잘릴 수 있어, format_func 대신 라벨 자체를 간결하게 관리)
+selected_idx = st.selectbox(
+    "사업을 선택하세요",
+    options=list(range(len(labels))),
+    format_func=lambda i: labels[i] if i < len(labels) else "",
 )
 
-st.caption("표에서 원하는 사업의 행을 클릭(선택)하면 아래에 상세 정보가 표시됩니다.")
+selected_row_id = row_ids[selected_idx]
+selected_full = df[df["_row_id"] == selected_row_id].iloc[0]
 
-# -----------------------------
-# 상세 보기(선택 기반)
-# -----------------------------
-# data_editor 자체는 선택 상태를 직접 주지 않아서,
-# 초보자 친화적으로 "사업명" 드롭다운으로도 상세 선택을 제공(실무에서 오히려 편합니다)
-st.divider()
-st.subheader("사업 상세 보기")
+# 전체 데이터(모든 컬럼) Key-Value 형태로 보여주기
+detail_items = []
+for c in df.columns:
+    if c in internal_cols or c in {"_label"}:
+        continue
+    v = selected_full.get(c, "")
+    if pd.isna(v):
+        v = ""
+    detail_items.append({"항목": c, "값": str(v)})
 
-# 선택 UI: 사업명 기반
-if COL_TITLE:
-    options = display_df[["_row_id", COL_TITLE]].copy()
-    options[COL_TITLE] = options[COL_TITLE].astype(str)
+detail_df = pd.DataFrame(detail_items)
 
-    selected_title = st.selectbox(
-        "사업명을 선택하세요 (선택하면 상세가 표시됩니다)",
-        options=options[COL_TITLE].tolist()
-    )
-    selected_row_id = int(options.loc[options[COL_TITLE] == selected_title, "_row_id"].iloc[0])
-else:
-    # 사업명이 없다면 row_id로
-    selected_row_id = int(display_df["_row_id"].iloc[0])
-
-row = df[df["_row_id"] == selected_row_id].iloc[0]
-
-# 상세 패널
-left, right = st.columns([1.2, 1])
-
-with left:
-    if COL_TITLE:
-        st.markdown(f"### {row[COL_TITLE]}")
-    else:
-        st.markdown("### 선택한 사업")
-
-    # 공고 링크
-    if COL_LINK and str(row.get(COL_LINK, "")).strip():
-        link = row[COL_LINK]
+# 링크는 보기 편하게 상단에도 한 번 노출
+if COL_LINK and COL_LINK in df.columns:
+    link = str(selected_full.get(COL_LINK, "")).strip()
+    if link:
         st.markdown(f"**공고 링크:** [{link}]({link})")
 
-    # 상세 페이지를 새 탭으로 열기 (쿼리 파라미터 detail=ROW_ID)
-    detail_url = f"?detail={selected_row_id}"
-    open_new_tab(detail_url, label="새 창(새 탭)으로 상세 페이지 열기", key="open_detail")
-
-    # 주요 컬럼만 간단히 보여주기(원하면 모두 표시 가능)
-    st.markdown("#### 주요 정보")
-    key_cols = [c for c in [COL_REGION, COL_FIELD, COL_SALES, COL_EMP] if c]
-    for c in key_cols:
-        st.write(f"- **{c}**: {row.get(c, '')}")
-
-with right:
-    st.markdown("#### 설명 이미지")
-    if COL_IMAGE and str(row.get(COL_IMAGE, "")).strip():
-        img = row[COL_IMAGE]
-        st.image(img, use_container_width=True)
-        st.markdown(f"[이미지 새 탭으로 열기]({img})")
-    else:
-        st.info("설명 이미지가 없습니다. (CSV에 '설명이미지/이미지URL' 컬럼을 추가하면 표시됩니다.)")
+st.dataframe(detail_df, use_container_width=True, hide_index=True)
